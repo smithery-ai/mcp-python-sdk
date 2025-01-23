@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from mcp.shared.exceptions import McpError
 from mcp.types import (
+    CancelledNotification,
     ClientNotification,
     ClientRequest,
     ClientResult,
@@ -44,20 +45,36 @@ class RequestResponder(Generic[ReceiveRequestT, SendResultT]):
         request_meta: RequestParams.Meta | None,
         request: ReceiveRequestT,
         session: "BaseSession",
+        cancel_scope: anyio.CancelScope | None,
     ) -> None:
         self.request_id = request_id
         self.request_meta = request_meta
         self.request = request
         self._session = session
         self._responded = False
+        self._cancel_scope = cancel_scope
 
     async def respond(self, response: SendResultT | ErrorData) -> None:
         assert not self._responded, "Request already responded to"
-        self._responded = True
 
-        await self._session._send_response(
-            request_id=self.request_id, response=response
-        )
+        if not self.cancelled:
+            self._responded = True
+
+            await self._session._send_response(
+                request_id=self.request_id, response=response
+            )
+
+    async def cancel(self) -> None:
+        if self._cancel_scope is not None:
+            self._cancel_scope.cancel()
+
+    @property
+    def in_flight(self) -> bool:
+        return not self._responded and not self.cancelled
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel_scope is not None and self._cancel_scope.cancel_called
 
 
 class BaseSession(
@@ -205,12 +222,21 @@ class BaseSession(
             await self._write_stream.send(JSONRPCMessage(jsonrpc_response))
 
     async def _receive_loop(self) -> None:
+        in_flight: dict[RequestId, RequestResponder] = {}
+
         async with (
             self._read_stream,
             self._write_stream,
             self._incoming_message_stream_writer,
         ):
             async for message in self._read_stream:
+                # Clean up completed requests
+                in_flight = {
+                    req_id: responder
+                    for req_id, responder in in_flight.items()
+                    if responder.in_flight
+                }
+
                 if isinstance(message, Exception):
                     await self._incoming_message_stream_writer.send(message)
                 elif isinstance(message.root, JSONRPCRequest):
@@ -219,27 +245,38 @@ class BaseSession(
                             by_alias=True, mode="json", exclude_none=True
                         )
                     )
-                    responder = RequestResponder(
-                        request_id=message.root.id,
-                        request_meta=validated_request.root.params.meta
-                        if validated_request.root.params
-                        else None,
-                        request=validated_request,
-                        session=self,
-                    )
 
-                    await self._received_request(responder)
-                    if not responder._responded:
-                        await self._incoming_message_stream_writer.send(responder)
+                    with anyio.CancelScope() as scope:
+                        responder = RequestResponder(
+                            request_id=message.root.id,
+                            request_meta=validated_request.root.params.meta
+                            if validated_request.root.params
+                            else None,
+                            request=validated_request,
+                            session=self,
+                            cancel_scope=scope,
+                        )
+
+                        in_flight[message.root.id] = responder
+
+                        await self._received_request(responder)
+                        if not responder._responded:
+                            await self._incoming_message_stream_writer.send(responder)
+
                 elif isinstance(message.root, JSONRPCNotification):
                     notification = self._receive_notification_type.model_validate(
                         message.root.model_dump(
                             by_alias=True, mode="json", exclude_none=True
                         )
                     )
-
-                    await self._received_notification(notification)
-                    await self._incoming_message_stream_writer.send(notification)
+                    # Handle cancellation notifications
+                    if isinstance(notification.root, CancelledNotification):
+                        cancelled_id = notification.root.params.requestId
+                        if cancelled_id in in_flight:
+                            await in_flight[cancelled_id].cancel()
+                    else:
+                        await self._received_notification(notification)
+                        await self._incoming_message_stream_writer.send(notification)
                 else:  # Response or error
                     stream = self._response_streams.pop(message.root.id, None)
                     if stream:
